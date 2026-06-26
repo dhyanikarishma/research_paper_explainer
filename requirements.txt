@@ -1,0 +1,29 @@
+# Web UI framework (pure Python, no JavaScript needed)
+streamlit==1.40.2
+
+# Google Gemini SDK - the LLM that powers summaries, quizzes, chat, etc.
+google-generativeai==0.8.3
+
+# Reads/extracts text from PDF files
+pymupdf==1.24.14
+
+# Numerical library - used for vector similarity search (the RAG core)
+numpy==2.1.3
+
+# Loads secret keys from a local .env file during development
+python-dotenv==1.0.1
+
+# --- V2/V3 feature dependencies ---
+
+# Fetch papers directly from arXiv by ID or URL
+arxiv==2.1.3
+
+# Optional alternative vector database backend (NumPy is the default)
+chromadb==0.5.23
+
+# Build interactive concept-map network graphs (rendered as HTML)
+pyvis==0.3.2
+
+# Convert Markdown notes into a downloadable, styled PDF
+markdown==3.7
+xhtml2pdf==0.2.16

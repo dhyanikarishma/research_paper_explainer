@@ -1,0 +1,24 @@
+# Secrets - NEVER upload these
+.env
+.streamlit/secrets.toml
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor junk
+.DS_Store
+.idea/
+.vscode/
+
+# Local uploads / scratch
+*.pdf
+!sample/*.pdf
+
+# Saved study sessions (may contain paper text - keep local)
+sessions/

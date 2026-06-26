@@ -1,0 +1,11 @@
+# Visual theme for the app. Tweak the colors to make it your own.
+[theme]
+primaryColor = "#6C5CE7"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1A1D29"
+textColor = "#FAFAFA"
+font = "sans serif"
+
+[server]
+# Keep uploads reasonable so big PDFs don't exhaust free-tier memory.
+maxUploadSize = 25
