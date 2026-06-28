@@ -44,7 +44,7 @@ its memory — which keeps answers accurate and reduces hallucination.
 
 ## 🛠️ Tech stack
 
-- **Python 3.12**
+- **Python 3.11.9**
 - **Streamlit** — web UI (pure Python)
 - **Google Gemini** — text generation + embeddings
 - **PyMuPDF** — PDF text extraction
