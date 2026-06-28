@@ -15,8 +15,6 @@ load_dotenv()
 
 # --- Model names -----------------------------------------------------------
 # The text-generation model (summaries, quizzes, chat answers).
-# If Google deprecates this name, change it here. To see what your key can
-# use, run the helper in README ("List available models").
 # If you hit free-tier quota limits, switch to "gemini-2.5-flash-lite",
 # which has more generous free limits (set GENERATION_MODEL in .env).
 GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gemini-2.5-flash")
@@ -36,12 +34,26 @@ TOP_K = int(os.getenv("TOP_K", "5"))
 
 # --- Vector backend --------------------------------------------------------
 # "numpy" (default, zero-setup, deploy-safe) or "chroma" (ChromaDB).
-# The UI lets the user switch at runtime; this is just the default.
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "numpy")
 
 # --- Study sessions --------------------------------------------------------
-# Where saved study sessions (summary, flashcards, quiz, etc.) are stored.
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "sessions")
+
+# --- Security / abuse-prevention limits ------------------------------------
+# Cap the model's output length to prevent runaway cost (AI/LLM rule).
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "2048"))
+
+# Reject oversized uploads server-side (defense in depth on top of the
+# Streamlit uploader limit). Documents default to 25 MB.
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+
+# Maximum characters accepted from a user's chat question (input validation).
+MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "2000"))
+
+# Per-session rate limit on AI calls (cost-attack / abuse protection).
+# Allow at most RATE_LIMIT_MAX_CALLS AI calls per RATE_LIMIT_WINDOW_SEC.
+RATE_LIMIT_MAX_CALLS = int(os.getenv("RATE_LIMIT_MAX_CALLS", "20"))
+RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 
 
 def get_api_key() -> str | None:
@@ -56,8 +68,6 @@ def get_api_key() -> str | None:
     if key:
         return key
 
-    # Import here so the module still works in plain-Python scripts/tests
-    # where Streamlit may not be running.
     try:
         import streamlit as st
 

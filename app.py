@@ -5,12 +5,15 @@ Run locally with:  streamlit run app.py
 This file is ONLY about the user interface and wiring. All the real logic
 lives in the `src/` package, which keeps this file readable.
 
-Features:
-  V1: upload, section-wise summary, flashcards, quiz, gaps, "ELI15", Q&A
-  V2: compare papers, literature review, Markdown/PDF export, citations,
-      interactive concept map
-  V3: ChromaDB backend option, arXiv fetch, save/load sessions, multi-agent
+Security wiring in this file:
+  - run_guarded(): every AI action goes through a per-session rate limit and
+    a single error handler that logs details server-side but shows the user
+    a generic message (no stack traces leaked).
+  - Uploads are size-checked server-side before parsing.
+  - Chat input is sanitized/length-capped before reaching the LLM.
 """
+
+import logging
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -19,7 +22,7 @@ from src.agents import run_multi_agent_analysis
 from src.arxiv_utils import fetch_arxiv_paper
 from src.chunking import split_text
 from src.concept_map import build_concept_map_html
-from src.config import get_api_key
+from src.config import MAX_UPLOAD_MB, get_api_key
 from src.features import (
     answer_question,
     build_markdown_notes,
@@ -35,14 +38,45 @@ from src.features import (
 from src.llm import GeminiError
 from src.pdf_export import markdown_to_pdf_bytes
 from src.pdf_utils import extract_text_from_pdf, get_pdf_metadata
+from src.security import check_rate_limit, sanitize_user_input
 from src.sessions import list_sessions, load_session, save_session
 from src.vector_store import get_vector_store
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("paper_explainer")
 
 st.set_page_config(
     page_title="Research Paper Explainer AI",
     page_icon="📄",
     layout="wide",
 )
+
+
+def run_guarded(label: str, fn, *args, **kwargs):
+    """Run an AI-backed action with rate limiting + safe error handling.
+
+    Returns the function result, or None if the call was rate-limited or
+    failed. Full error detail is logged server-side; the user only sees a
+    short, safe message.
+    """
+    allowed, retry_after = check_rate_limit()
+    if not allowed:
+        st.warning(
+            f"⏳ You've hit the per-session limit. Please wait ~{retry_after}s "
+            "and try again."
+        )
+        return None
+    try:
+        return fn(*args, **kwargs)
+    except GeminiError as exc:
+        # Operational AI errors (quota, bad key) are safe and useful to show.
+        logger.warning("AI action '%s' failed: %s", label, exc)
+        st.error(f"AI service error: {exc}")
+        return None
+    except Exception:  # anything unexpected
+        logger.exception("Unexpected error in AI action '%s'", label)
+        st.error("Something went wrong while processing that. Please try again.")
+        return None
 
 
 def init_state():
@@ -60,12 +94,10 @@ def init_state():
         "concept_graph": None,
         "agent_result": None,
         "chat_history": [],
-        # Compare / literature-review state
         "paper_b_text": None,
         "paper_b_name": None,
         "compare_result": None,
         "litreview_result": None,
-        # Settings
         "backend": "numpy",
         "last_loaded_key": None,
     }
@@ -77,10 +109,19 @@ init_state()
 
 
 def load_paper(file_bytes: bytes, name: str, metadata: dict | None = None):
-    """Parse a PDF, build the vector index, and reset prior results."""
+    """Parse a PDF, build the vector index, and reset prior results.
+
+    Enforces a server-side upload size limit before doing any work.
+    """
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        raise ValueError(
+            f"File is too large ({len(file_bytes) // (1024 * 1024)} MB). "
+            f"The limit is {MAX_UPLOAD_MB} MB."
+        )
+
     text = extract_text_from_pdf(file_bytes)
     meta = metadata or {}
-    # Always refresh the page count from the actual bytes.
     pdf_meta = get_pdf_metadata(file_bytes)
     meta = {**pdf_meta, **{k: v for k, v in meta.items() if v}}
 
@@ -91,7 +132,6 @@ def load_paper(file_bytes: bytes, name: str, metadata: dict | None = None):
     st.session_state.paper_name = name
     st.session_state.metadata = meta
     st.session_state.vector_store = store
-    # Reset everything generated for the previous paper.
     for k in [
         "summary", "flashcards", "quiz", "gaps", "citations",
         "concept_graph", "agent_result", "compare_result", "litreview_result",
@@ -129,14 +169,19 @@ with st.sidebar:
                     load_paper(uploaded.read(), uploaded.name)
                     st.session_state.last_loaded_key = uploaded.name
                     st.success(f"Loaded: {uploaded.name}")
-                except (ValueError, GeminiError) as exc:
+                except ValueError as exc:
                     st.error(str(exc))
+                except GeminiError as exc:
+                    st.error(f"AI service error: {exc}")
+                except Exception:
+                    logger.exception("Failed to load uploaded PDF")
+                    st.error("Could not process that PDF. Please try another file.")
     else:
         arxiv_input = st.text_input(
             "arXiv ID or URL", placeholder="e.g. 1706.03762"
         )
         if st.button("Fetch from arXiv", use_container_width=True) and arxiv_input:
-            key = f"arxiv:{arxiv_input}"
+            key = f"arxiv:{sanitize_user_input(arxiv_input, max_len=200)}"
             with st.spinner("Fetching from arXiv and indexing..."):
                 try:
                     pdf_bytes, meta = fetch_arxiv_paper(arxiv_input)
@@ -144,8 +189,11 @@ with st.sidebar:
                     load_paper(pdf_bytes, name, meta)
                     st.session_state.last_loaded_key = key
                     st.success(f"Loaded: {name}")
-                except (ValueError, GeminiError, Exception) as exc:
-                    st.error(f"Could not fetch paper: {exc}")
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception:
+                    logger.exception("Failed to fetch arXiv paper")
+                    st.error("Could not fetch that paper. Check the ID/URL and try again.")
 
     st.divider()
     st.subheader("2. Settings")
@@ -211,8 +259,9 @@ with st.sidebar:
                         }
                     )
                     st.success("Session restored.")
-                except (GeminiError, KeyError, OSError) as exc:
-                    st.error(f"Could not load session: {exc}")
+                except Exception:
+                    logger.exception("Failed to load session")
+                    st.error("Could not load that session.")
 
     if st.session_state.metadata:
         meta = st.session_state.metadata
@@ -251,12 +300,9 @@ with tab_summary:
     st.caption("Explain Like I'm 15 + a section-by-section breakdown.")
     if st.button("Generate summary", key="btn_summary"):
         with st.spinner("Summarizing..."):
-            try:
-                st.session_state.summary = generate_summary(
-                    st.session_state.paper_text
-                )
-            except GeminiError as exc:
-                st.error(str(exc))
+            result = run_guarded("summary", generate_summary, st.session_state.paper_text)
+            if result is not None:
+                st.session_state.summary = result
     if st.session_state.summary:
         st.markdown(st.session_state.summary)
 
@@ -267,12 +313,12 @@ with tab_cards:
     num_cards = st.slider("How many cards?", 4, 15, 8, key="num_cards")
     if st.button("Generate flashcards", key="btn_cards"):
         with st.spinner("Creating flashcards..."):
-            try:
-                st.session_state.flashcards = generate_flashcards(
-                    st.session_state.paper_text, count=num_cards
-                )
-            except (GeminiError, ValueError) as exc:
-                st.error(f"Could not generate flashcards: {exc}")
+            result = run_guarded(
+                "flashcards", generate_flashcards,
+                st.session_state.paper_text, count=num_cards,
+            )
+            if result is not None:
+                st.session_state.flashcards = result
     if st.session_state.flashcards:
         for i, card in enumerate(st.session_state.flashcards, 1):
             with st.expander(f"{i}. {card['front']}"):
@@ -285,12 +331,12 @@ with tab_quiz:
     num_q = st.slider("How many questions?", 3, 10, 5, key="num_q")
     if st.button("Generate quiz", key="btn_quiz"):
         with st.spinner("Writing quiz..."):
-            try:
-                st.session_state.quiz = generate_quiz(
-                    st.session_state.paper_text, count=num_q
-                )
-            except (GeminiError, ValueError) as exc:
-                st.error(f"Could not generate quiz: {exc}")
+            result = run_guarded(
+                "quiz", generate_quiz,
+                st.session_state.paper_text, count=num_q,
+            )
+            if result is not None:
+                st.session_state.quiz = result
 
     if st.session_state.quiz:
         with st.form("quiz_form"):
@@ -326,12 +372,11 @@ with tab_gaps:
     st.subheader("Research Gaps")
     if st.button("Analyze research gaps", key="btn_gaps"):
         with st.spinner("Thinking like a peer reviewer..."):
-            try:
-                st.session_state.gaps = generate_research_gaps(
-                    st.session_state.paper_text
-                )
-            except GeminiError as exc:
-                st.error(str(exc))
+            result = run_guarded(
+                "gaps", generate_research_gaps, st.session_state.paper_text
+            )
+            if result is not None:
+                st.session_state.gaps = result
     if st.session_state.gaps:
         st.markdown(st.session_state.gaps)
 
@@ -343,19 +388,19 @@ with tab_chat:
     for role, message in st.session_state.chat_history:
         with st.chat_message(role):
             st.markdown(message)
-    question = st.chat_input("Ask a question about this paper...")
-    if question:
+    raw_question = st.chat_input("Ask a question about this paper...")
+    if raw_question:
+        question = sanitize_user_input(raw_question)
         st.session_state.chat_history.append(("user", question))
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
             with st.spinner("Searching the paper..."):
-                try:
-                    answer = answer_question(
-                        question, st.session_state.vector_store
-                    )
-                except GeminiError as exc:
-                    answer = f"⚠️ {exc}"
+                answer = run_guarded(
+                    "chat", answer_question, question, st.session_state.vector_store
+                )
+            if answer is None:
+                answer = "⚠️ I couldn't answer that right now. Please try again."
             st.markdown(answer)
         st.session_state.chat_history.append(("assistant", answer))
 
@@ -366,12 +411,11 @@ with tab_cite:
     st.caption("Pulls the paper's reference list into a structured table.")
     if st.button("Extract citations", key="btn_cite"):
         with st.spinner("Reading the references section..."):
-            try:
-                st.session_state.citations = extract_citations(
-                    st.session_state.paper_text
-                )
-            except GeminiError as exc:
-                st.error(str(exc))
+            result = run_guarded(
+                "citations", extract_citations, st.session_state.paper_text
+            )
+            if result is not None:
+                st.session_state.citations = result
     if st.session_state.citations is not None:
         if st.session_state.citations:
             st.dataframe(st.session_state.citations, use_container_width=True)
@@ -386,12 +430,11 @@ with tab_map:
     st.caption("Drag nodes, zoom, and hover edges to explore relationships.")
     if st.button("Generate concept map", key="btn_map"):
         with st.spinner("Mapping the key concepts..."):
-            try:
-                st.session_state.concept_graph = generate_concept_map(
-                    st.session_state.paper_text
-                )
-            except (GeminiError, ValueError) as exc:
-                st.error(f"Could not build concept map: {exc}")
+            result = run_guarded(
+                "concept_map", generate_concept_map, st.session_state.paper_text
+            )
+            if result is not None:
+                st.session_state.concept_graph = result
     if st.session_state.concept_graph:
         graph = st.session_state.concept_graph
         if graph.get("nodes"):
@@ -410,15 +453,15 @@ with tab_agents:
     )
     if st.button("Run multi-agent analysis", key="btn_agents"):
         status = st.empty()
-        try:
-            result = run_multi_agent_analysis(
-                st.session_state.paper_text,
-                progress=lambda label: status.info(f"🤖 {label}"),
-            )
+        result = run_guarded(
+            "multi_agent",
+            run_multi_agent_analysis,
+            st.session_state.paper_text,
+            progress=lambda label: status.info(f"🤖 {label}"),
+        )
+        if result is not None:
             st.session_state.agent_result = result
             status.success("Analysis complete.")
-        except GeminiError as exc:
-            status.error(str(exc))
 
     result = st.session_state.agent_result
     if result:
@@ -443,7 +486,10 @@ with tab_compare:
     if paper_b is not None and paper_b.name != st.session_state.paper_b_name:
         with st.spinner("Reading Paper B..."):
             try:
-                st.session_state.paper_b_text = extract_text_from_pdf(paper_b.read())
+                b_bytes = paper_b.read()
+                if len(b_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise ValueError(f"File exceeds the {MAX_UPLOAD_MB} MB limit.")
+                st.session_state.paper_b_text = extract_text_from_pdf(b_bytes)
                 st.session_state.paper_b_name = paper_b.name
                 st.success(f"Paper B loaded: {paper_b.name}")
             except ValueError as exc:
@@ -451,15 +497,15 @@ with tab_compare:
 
     if st.session_state.paper_b_text and st.button("Compare papers", key="btn_compare"):
         with st.spinner("Comparing..."):
-            try:
-                st.session_state.compare_result = compare_papers(
-                    st.session_state.paper_text,
-                    st.session_state.paper_name or "Paper A",
-                    st.session_state.paper_b_text,
-                    st.session_state.paper_b_name or "Paper B",
-                )
-            except GeminiError as exc:
-                st.error(str(exc))
+            result = run_guarded(
+                "compare", compare_papers,
+                st.session_state.paper_text,
+                st.session_state.paper_name or "Paper A",
+                st.session_state.paper_b_text,
+                st.session_state.paper_b_name or "Paper B",
+            )
+            if result is not None:
+                st.session_state.compare_result = result
     if st.session_state.compare_result:
         st.markdown(st.session_state.compare_result)
 
@@ -482,10 +528,9 @@ with tab_lit:
                  "text": st.session_state.paper_b_text}
             )
         with st.spinner("Writing the literature review..."):
-            try:
-                st.session_state.litreview_result = generate_literature_review(papers)
-            except GeminiError as exc:
-                st.error(str(exc))
+            result = run_guarded("lit_review", generate_literature_review, papers)
+            if result is not None:
+                st.session_state.litreview_result = result
     if st.session_state.litreview_result:
         st.markdown(st.session_state.litreview_result)
 
@@ -524,8 +569,9 @@ with tab_export:
                 mime="application/pdf",
                 use_container_width=True,
             )
-        except Exception as exc:
-            st.warning(f"PDF export unavailable: {exc}")
+        except Exception:
+            logger.exception("PDF export failed")
+            st.warning("PDF export is unavailable right now.")
 
     with st.expander("Preview notes"):
         st.markdown(notes)
